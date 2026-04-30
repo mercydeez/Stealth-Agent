@@ -1,0 +1,1 @@
+"""Stealth Agent application package."""
