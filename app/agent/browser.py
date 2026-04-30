@@ -13,6 +13,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 stealth = Stealth()
+GROQ_MODEL = "llama-3.3-70b-versatile"
 
 CHROME_WINDOWS_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -33,6 +34,12 @@ RESUME_SELECTORS = [
     'input[type="file"]',
     'input[name="resume"]',
     '[class*="resume"] input',
+]
+
+UPLOAD_BUTTON_SELECTORS = [
+    '[class*="resume"] button',
+    '[class*="upload"] button',
+    'label[for*="resume"]',
 ]
 
 MARKDOWN_FIELD_ALIASES = {
@@ -58,6 +65,8 @@ STANDARD_QUESTION_TERMS = {
     "resume",
     "cv",
 }
+
+MEANINGLESS_LABELS = {"", "*", "✱"}
 
 
 def parse_applicant_data(applicant_data: str) -> dict[str, str]:
@@ -126,6 +135,168 @@ def _fill_lever_field(page: Page, field_name: str, selector: str, value: str) ->
     return True
 
 
+def _fill_location_field(page: Page, applicant_fields: dict[str, str]) -> bool:
+    location_value = applicant_fields.get("location", "")
+    if not location_value:
+        logger.info("Skipping location because no applicant value was provided")
+        return False
+
+    location_input = page.query_selector("input[name='location']")
+    if not location_input:
+        location_input = page.query_selector("input[placeholder*='ocation']")
+    if not location_input:
+        logger.info("Field not found: location")
+        return False
+
+    location_input.click()
+    page.wait_for_timeout(500)
+    page.keyboard.type(location_value, delay=100)
+    page.wait_for_timeout(1500)
+
+    suggestion = page.query_selector(
+        ".autocomplete-option, [class*='suggestion'], [class*='dropdown'] li"
+    )
+    if suggestion:
+        suggestion.click()
+        page.wait_for_timeout(500)
+    else:
+        page.keyboard.press("Enter")
+
+    logger.info("Filled field: location")
+    return True
+
+
+def _get_select_label(select: ElementHandle) -> str:
+    aria_label = select.get_attribute("aria-label")
+    if aria_label and aria_label.strip():
+        return aria_label.strip()
+
+    label_text = select.evaluate(
+        """element => {
+            const id = element.getAttribute("id");
+            if (id) {
+                const explicitLabel = document.querySelector(`label[for="${id}"]`);
+                if (explicitLabel && explicitLabel.innerText.trim()) {
+                    return explicitLabel.innerText.trim();
+                }
+            }
+
+            let sibling = element.previousElementSibling;
+            while (sibling) {
+                if (sibling.tagName.toLowerCase() === "label" && sibling.innerText.trim()) {
+                    return sibling.innerText.trim();
+                }
+                sibling = sibling.previousElementSibling;
+            }
+
+            const fieldContainer = element.parentElement?.parentElement;
+            const previousText = fieldContainer?.previousElementSibling?.innerText || "";
+            if (previousText.trim()) {
+                return previousText.trim();
+            }
+
+            const listItemText = fieldContainer?.closest('li')?.innerText || "";
+            if (listItemText.trim()) {
+                return listItemText.trim().split('\\n')[0];
+            }
+
+            const container = element.closest('.application-question, .form-group, [class*="question"], [class*="field"]');
+            return container?.querySelector('label, p, span')?.innerText || "";
+        }"""
+    )
+    return label_text.strip() if label_text else ""
+
+
+def _is_meaningful_label(label: str) -> bool:
+    normalized = _normalize_label(label)
+    if normalized in MEANINGLESS_LABELS:
+        return False
+
+    alpha_numeric = re.sub(r"[^a-z0-9]+", "", normalized)
+    return len(alpha_numeric) >= 3
+
+
+def _pick_dropdown_option(applicant_data: str, label: str, option_texts: list[str]) -> str | None:
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        logger.warning("GROQ_API_KEY is not set; skipping dropdown selection for '%s'", label)
+        return None
+
+    prompt = f"""
+Job application dropdown field.
+Question/Label: {label}
+Available options: {option_texts}
+Applicant background: {applicant_data}
+
+Reply with ONLY the exact text of the best option to select. Nothing else.
+"""
+
+    try:
+        client = Groq(api_key=api_key)
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Choose the single best dropdown option for a job application field.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as exc:
+        logger.warning("Failed to choose dropdown option for '%s': %s", label, exc)
+        return None
+
+
+def _fill_dropdown_fields(page: Page, applicant_data: str) -> None:
+    selects = page.query_selector_all("select")
+    logger.info("Found %s dropdown(s) on page", len(selects))
+
+    for select in selects:
+        label = _get_select_label(select)
+        if not label or not _is_meaningful_label(label):
+            logger.info("Skipping dropdown because no label could be determined")
+            continue
+
+        options = select.query_selector_all("option")
+        option_texts = [option.inner_text().strip() for option in options]
+        option_texts = [text for text in option_texts if text]
+
+        if option_texts and option_texts[0].lower().startswith("select"):
+            option_texts = option_texts[1:]
+
+        if not option_texts:
+            logger.info("Skipping dropdown '%s' because it has no usable options", label)
+            continue
+
+        selected_option = _pick_dropdown_option(applicant_data, label, option_texts)
+        if not selected_option:
+            continue
+
+        matched_option = next(
+            (option_text for option_text in option_texts if option_text.lower() == selected_option.lower()),
+            None,
+        )
+        if not matched_option:
+            logger.warning(
+                "Groq suggested '%s' for dropdown '%s', but no exact option matched",
+                selected_option,
+                label,
+            )
+            continue
+
+        try:
+            select.select_option(label=matched_option)
+            page.wait_for_timeout(800)
+            logger.info("Selected dropdown '%s' with option '%s'", label, matched_option)
+        except Exception as exc:
+            logger.warning("Failed to select dropdown '%s': %s", label, exc)
+
+
 def _confirm_resume_upload(file_input: ElementHandle, filename: str) -> bool:
     try:
         input_value = file_input.input_value()
@@ -154,28 +325,39 @@ def _confirm_resume_upload(file_input: ElementHandle, filename: str) -> bool:
 
 
 def _upload_resume(page: Page, resume_path: str) -> bool:
+    for selector in UPLOAD_BUTTON_SELECTORS:
+        upload_button = page.query_selector(selector)
+        if upload_button:
+            try:
+                upload_button.click()
+                page.wait_for_timeout(1000)
+                logger.info("Clicked visible resume upload control: %s", selector)
+                break
+            except Exception as exc:
+                logger.info("Could not click upload control %s: %s", selector, exc)
+
+    filename = Path(resume_path).name
+
     for selector in RESUME_SELECTORS:
         file_input = page.query_selector(selector)
         if file_input is None:
             logger.info("Resume upload field not found using selector %s", selector)
             continue
 
-        filename = Path(resume_path).name
-
         try:
             logger.info("Resume upload field found using selector %s", selector)
             file_input.set_input_files(resume_path)
             page.wait_for_timeout(2000)
+            page_content = page.content()
+            if filename in page_content:
+                logger.info("Resume upload confirmed: %s", filename)
+                return True
+
+            logger.warning("Resume set but filename not confirmed in page")
+            return True
         except Exception as exc:
             logger.warning("Resume upload failed for %s: %s", filename, exc)
             return False
-
-        if _confirm_resume_upload(file_input, filename):
-            logger.info("Resume uploaded successfully")
-            return True
-
-        logger.warning("Resume upload could not be confirmed: %s", filename)
-        return False
 
     logger.warning("No resume upload field found")
     return False
@@ -187,37 +369,69 @@ def _normalize_label(text: str) -> str:
 
 def _is_standard_question(label: str) -> bool:
     normalized = _normalize_label(label)
-    return any(term in normalized for term in STANDARD_QUESTION_TERMS)
+    normalized = normalized.rstrip(":* ").strip()
+    return normalized in STANDARD_QUESTION_TERMS
 
 
-def _get_textarea_label(textarea: ElementHandle) -> str:
-    aria_label = textarea.get_attribute("aria-label")
-    if aria_label and aria_label.strip():
-        return aria_label.strip()
+def _get_textarea_label(page: Page, textarea: ElementHandle) -> str:
+    try:
+        # Method 1: aria-label
+        label = textarea.get_attribute("aria-label") or ""
+        if label.strip():
+            return label.strip()
 
-    label_info = textarea.evaluate(
-        """element => {
-            const id = element.getAttribute("id");
-            if (id) {
-                const explicitLabel = document.querySelector(`label[for="${id}"]`);
-                if (explicitLabel && explicitLabel.innerText.trim()) {
-                    return explicitLabel.innerText.trim();
+        # Method 2: placeholder
+        label = textarea.get_attribute("placeholder") or ""
+        if label.strip():
+            return label.strip()
+
+        # Method 3: id -> label[for=id]
+        tid = textarea.get_attribute("id") or ""
+        if tid:
+            label_el = page.query_selector(f"label[for='{tid}']")
+            if label_el:
+                text = label_el.inner_text().strip()
+                if text:
+                    return text
+
+        # Method 4: name attribute -> find matching label in page
+        name = textarea.get_attribute("name") or ""
+        if name:
+            label_el = page.query_selector(f"label[for='{name}']")
+            if label_el:
+                text = label_el.inner_text().strip()
+                if text:
+                    return text
+
+        # Method 5: Walk up DOM using inner_text of parent containers
+        # Try up to 5 levels up
+        label = page.evaluate(
+            """
+            (el) => {
+                let node = el.parentElement;
+                for (let i = 0; i < 5; i++) {
+                    if (!node) break;
+                    const labels = node.querySelectorAll('label, h4, h3, p, span, div.application-label, div[class*="label"]');
+                    for (const l of labels) {
+                        const txt = l.innerText.trim();
+                        if (txt && txt.length > 3 && txt.length < 200) {
+                            return txt;
+                        }
+                    }
+                    node = node.parentElement;
                 }
+                return '';
             }
+            """,
+            textarea,
+        )
+        if label and label.strip():
+            return label.strip()
 
-            let sibling = element.previousElementSibling;
-            while (sibling) {
-                if (sibling.tagName.toLowerCase() === "label" && sibling.innerText.trim()) {
-                    return sibling.innerText.trim();
-                }
-                sibling = sibling.previousElementSibling;
-            }
-
-            const parentText = element.parentElement?.innerText || "";
-            return parentText.trim();
-        }"""
-    )
-    return label_info.strip() if label_info else ""
+        return ""
+    except Exception as e:
+        logger.warning(f"Could not get textarea label: {e}")
+        return ""
 
 
 def _generate_groq_answer(applicant_data: str, question_label: str) -> str | None:
@@ -229,7 +443,7 @@ def _generate_groq_answer(applicant_data: str, question_label: str) -> str | Non
     try:
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
-            model="llama3-70b-8192",
+            model=GROQ_MODEL,
             messages=[
                 {
                     "role": "system",
@@ -254,14 +468,43 @@ def _generate_groq_answer(applicant_data: str, question_label: str) -> str | Non
         return None
 
 
-def _answer_custom_questions(page: Page, applicant_data: str) -> list[str]:
-    questions_answered: list[str] = []
+def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, str]]:
+    questions_answered: list[dict[str, str]] = []
+    for scroll_position in [0.25, 0.5, 0.75, 1.0]:
+        page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {scroll_position})")
+        page.wait_for_timeout(1000)
+
+    # DEBUG - log everything found on page
+    all_inputs = page.query_selector_all("input")
+    all_textareas = page.query_selector_all("textarea")
+    all_selects = page.query_selector_all("select")
+
+    logger.info(f"DEBUG - Total inputs found: {len(all_inputs)}")
+    logger.info(f"DEBUG - Total textareas found: {len(all_textareas)}")  
+    logger.info(f"DEBUG - Total selects found: {len(all_selects)}")
+
+    for i, inp in enumerate(all_inputs):
+        name = inp.get_attribute("name") or ""
+        placeholder = inp.get_attribute("placeholder") or ""
+        input_type = inp.get_attribute("type") or ""
+        logger.info(f"DEBUG input[{i}]: type={input_type} name={name} placeholder={placeholder}")
+
+    for i, ta in enumerate(all_textareas):
+        aria = ta.get_attribute("aria-label") or ""
+        placeholder = ta.get_attribute("placeholder") or ""
+        tid = ta.get_attribute("id") or ""
+        logger.info(f"DEBUG textarea[{i}]: id={tid} aria-label={aria} placeholder={placeholder}")
+
+    for i, sel in enumerate(all_selects):
+        name = sel.get_attribute("name") or ""
+        logger.info(f"DEBUG select[{i}]: name={name}")
+
     textareas = page.query_selector_all("textarea")
-    logger.info("Found %s textarea elements on the page", len(textareas))
+    logger.info("Found %s textarea(s)", len(textareas))
 
     for textarea in textareas:
-        question_label = _get_textarea_label(textarea)
-        if not question_label:
+        question_label = _get_textarea_label(page, textarea)
+        if not question_label or not _is_meaningful_label(question_label):
             logger.info("Skipping textarea because no label could be determined")
             continue
 
@@ -277,7 +520,12 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[str]:
         page.keyboard.press("Control+A")
         page.keyboard.press("Backspace")
         page.keyboard.type(answer, delay=80)
-        questions_answered.append(question_label)
+        questions_answered.append(
+            {
+                "question": question_label,
+                "answer_preview": answer[:100],
+            }
+        )
         logger.info("Answered question: %s", question_label[:50])
 
     return questions_answered
@@ -354,6 +602,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
 
             page_title = page.title()
             logger.info("Page loaded successfully with title '%s'", page_title)
+            page.wait_for_timeout(2000)
 
             is_dead_page = "404" in page_title.lower() or "not found" in page_title.lower()
             if is_dead_page:
@@ -377,8 +626,18 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
                 )
                 if was_filled:
                     fields_filled.append(field_name)
+                page.wait_for_timeout(1000)
+
+            location_filled = _fill_location_field(page, applicant)
+            if location_filled:
+                fields_filled.append("location")
+            page.wait_for_timeout(1000)
+
+            _fill_dropdown_fields(page, applicant_data)
+            page.wait_for_timeout(1000)
 
             resume_uploaded = _upload_resume(page, resume_path)
+            page.wait_for_timeout(1000)
             _scan_additional_fields(page)
             questions_answered = _answer_custom_questions(page, applicant_data)
 
