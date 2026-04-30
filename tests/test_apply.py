@@ -33,4 +33,9 @@ def test_apply_endpoint_returns_browser_agent_response(monkeypatch) -> None:
     assert response.json() == {
         "status": "fields_filled",
         "fields_filled": ["name", "email"],
+        "resume_uploaded": False,
+        "questions_answered": [],
+        "page_title": None,
+        "step": None,
+        "reason": None,
     }

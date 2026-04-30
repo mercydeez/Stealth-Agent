@@ -23,7 +23,7 @@ class ApplicationResponse(BaseModel):
         default=False,
         description="Whether a resume file was uploaded successfully.",
     )
-    questions_answered: list[str] = Field(
+    questions_answered: list[dict[str, str]] = Field(
         default_factory=list,
         description="Custom screening questions answered by the agent.",
     )
