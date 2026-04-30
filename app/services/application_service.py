@@ -23,6 +23,7 @@ class ApplicationService:
             fields_filled=result.get("fields_filled", []),
             resume_uploaded=result.get("resume_uploaded", False),
             questions_answered=result.get("questions_answered", []),
+            bot_blocked=result.get("bot_blocked", False),
             page_title=result.get("page_title"),
             step=result.get("step"),
             reason=result.get("reason"),
