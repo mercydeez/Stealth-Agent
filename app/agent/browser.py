@@ -9,6 +9,8 @@ from playwright.sync_api import ElementHandle, Page, TimeoutError as PlaywrightT
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
+from app.core.config import settings
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,16 @@ STANDARD_QUESTION_TERMS = {
 }
 
 MEANINGLESS_LABELS = {"", "*", "✱"}
+BOT_BLOCKER_TERMS = (
+    "verify you are human",
+    "verify you're human",
+    "captcha",
+    "access denied",
+    "unusual traffic",
+    "security check",
+    "cloudflare",
+    "bot detection",
+)
 
 
 def parse_applicant_data(applicant_data: str) -> dict[str, str]:
@@ -114,6 +126,24 @@ def _wait_for_form_or_apply_link(page: Page) -> bool:
     page.wait_for_timeout(2000)
     logger.info("Application form detected after navigating to apply page")
     return True
+
+
+def _detect_bot_blocker(page: Page) -> str | None:
+    try:
+        page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
+    except Exception:
+        page_text = ""
+
+    try:
+        page_title = page.title()
+    except Exception:
+        page_title = ""
+
+    combined_text = f"{page_title}\n{page_text}".lower()
+    for term in BOT_BLOCKER_TERMS:
+        if term in combined_text:
+            return term
+    return None
 
 
 def _fill_lever_field(page: Page, field_name: str, selector: str, value: str) -> bool:
@@ -217,7 +247,7 @@ def _is_meaningful_label(label: str) -> bool:
 
 
 def _pick_dropdown_option(applicant_data: str, label: str, option_texts: list[str]) -> str | None:
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = settings.groq_api_key or os.getenv("GROQ_API_KEY")
     if not api_key:
         logger.warning("GROQ_API_KEY is not set; skipping dropdown selection for '%s'", label)
         return None
@@ -435,7 +465,7 @@ def _get_textarea_label(page: Page, textarea: ElementHandle) -> str:
 
 
 def _generate_groq_answer(applicant_data: str, question_label: str) -> str | None:
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = settings.groq_api_key or os.getenv("GROQ_API_KEY")
     if not api_key:
         logger.warning("GROQ_API_KEY is not set; skipping question answering")
         return None
@@ -571,7 +601,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
 
     with sync_playwright() as playwright:
         logger.info("Launching Chromium browser")
-        browser = playwright.chromium.launch(headless=False)
+        browser = playwright.chromium.launch(headless=settings.browser_headless)
 
         try:
             logger.info("Creating browser context with Chrome Windows user agent")
@@ -585,10 +615,50 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
             try:
                 logger.info("Navigating to job URL")
                 page.goto(job_url, wait_until="networkidle")
+                bot_blocker_reason = _detect_bot_blocker(page)
+                if bot_blocker_reason:
+                    logger.warning("Bot blocker detected after initial navigation: %s", bot_blocker_reason)
+                    return {
+                        "status": "failed",
+                        "step": "bot_blocked",
+                        "reason": f"Bot blocker detected: {bot_blocker_reason}",
+                        "fields_filled": [],
+                        "resume_uploaded": False,
+                        "questions_answered": [],
+                        "bot_blocked": True,
+                        "page_title": page.title(),
+                    }
+
                 if not _wait_for_form_or_apply_link(page):
+                    bot_blocker_reason = _detect_bot_blocker(page)
+                    if bot_blocker_reason:
+                        logger.warning("Bot blocker detected while waiting for form: %s", bot_blocker_reason)
+                        return {
+                            "status": "failed",
+                            "step": "bot_blocked",
+                            "reason": f"Bot blocker detected: {bot_blocker_reason}",
+                            "fields_filled": [],
+                            "resume_uploaded": False,
+                            "questions_answered": [],
+                            "bot_blocked": True,
+                            "page_title": page.title(),
+                        }
                     raise PlaywrightTimeoutError("Form not found or apply link unavailable")
             except PlaywrightTimeoutError:
                 page_title = page.title()
+                bot_blocker_reason = _detect_bot_blocker(page)
+                if bot_blocker_reason:
+                    logger.warning("Bot blocker detected on timed out page '%s': %s", page_title, bot_blocker_reason)
+                    return {
+                        "status": "failed",
+                        "step": "bot_blocked",
+                        "reason": f"Bot blocker detected: {bot_blocker_reason}",
+                        "fields_filled": [],
+                        "resume_uploaded": False,
+                        "questions_answered": [],
+                        "bot_blocked": True,
+                        "page_title": page_title,
+                    }
                 logger.warning("Form not found or page timed out for title '%s'", page_title)
                 return {
                     "status": "failed",
@@ -597,12 +667,27 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
                     "fields_filled": [],
                     "resume_uploaded": False,
                     "questions_answered": [],
+                    "bot_blocked": False,
                     "page_title": page_title,
                 }
 
             page_title = page.title()
             logger.info("Page loaded successfully with title '%s'", page_title)
             page.wait_for_timeout(2000)
+
+            bot_blocker_reason = _detect_bot_blocker(page)
+            if bot_blocker_reason:
+                logger.warning("Bot blocker detected after form load: %s", bot_blocker_reason)
+                return {
+                    "status": "failed",
+                    "step": "bot_blocked",
+                    "reason": f"Bot blocker detected: {bot_blocker_reason}",
+                    "fields_filled": fields_filled,
+                    "resume_uploaded": False,
+                    "questions_answered": [],
+                    "bot_blocked": True,
+                    "page_title": page_title,
+                }
 
             is_dead_page = "404" in page_title.lower() or "not found" in page_title.lower()
             if is_dead_page:
@@ -614,6 +699,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
                     "fields_filled": [],
                     "resume_uploaded": False,
                     "questions_answered": [],
+                    "bot_blocked": False,
                     "page_title": page_title,
                 }
 
@@ -644,10 +730,11 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
             logger.info("Finished filling fields: %s", fields_filled)
 
             return {
-                "status": "fields_filled",
+                "status": "ready_to_submit",
                 "fields_filled": fields_filled,
                 "resume_uploaded": resume_uploaded,
                 "questions_answered": questions_answered,
+                "bot_blocked": False,
                 "page_title": page_title,
             }
         finally:

@@ -27,6 +27,10 @@ class ApplicationResponse(BaseModel):
         default_factory=list,
         description="Custom screening questions answered by the agent.",
     )
+    bot_blocked: bool = Field(
+        default=False,
+        description="Whether the run appeared to hit anti-bot protection.",
+    )
     page_title: str | None = Field(
         default=None,
         description="Title of the page that was processed.",
