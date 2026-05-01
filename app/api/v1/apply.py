@@ -17,12 +17,12 @@ def _failure_status_code(response: ApplicationResponse) -> int:
         return status.HTTP_503_SERVICE_UNAVAILABLE
     if step == "validation":
         return status.HTTP_400_BAD_REQUEST
-    if step == "page_load":
-        if "timed out" in reason:
-            return status.HTTP_504_GATEWAY_TIMEOUT
-        if "not found" in reason:
-            return status.HTTP_404_NOT_FOUND
-        return status.HTTP_502_BAD_GATEWAY
+    if "timed out" in reason:
+        return status.HTTP_504_GATEWAY_TIMEOUT
+    if "not found" in reason and step in {"page_load", "detect_form"}:
+        return status.HTTP_404_NOT_FOUND
+    if step == "page_load" and "form not found" in reason:
+        return status.HTTP_404_NOT_FOUND
     return status.HTTP_500_INTERNAL_SERVER_ERROR
 
 
