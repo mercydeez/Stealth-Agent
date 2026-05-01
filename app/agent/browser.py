@@ -73,6 +73,7 @@ BOT_BLOCKER_TERMS = (
     "verify you are human",
     "verify you're human",
     "captcha",
+    "hcaptcha",
     "access denied",
     "unusual traffic",
     "security check",
@@ -122,6 +123,37 @@ def _detect_bot_blocker(page: Page) -> str | None:
     for term in BOT_BLOCKER_TERMS:
         if term in combined_text:
             return term
+
+    try:
+        captcha_visible = bool(
+            page.evaluate(
+                """() => {
+                    const selectors = [
+                        '.h-captcha',
+                        '#h-captcha',
+                        'iframe[title*="hCaptcha"]',
+                        'iframe[src*="hcaptcha"]',
+                        '[name="h-captcha-response"]',
+                        'iframe[title*="captcha"]',
+                    ];
+                    return selectors.some((selector) => {
+                        const node = document.querySelector(selector);
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.visibility !== "hidden"
+                            && style.display !== "none"
+                            && rect.width > 0
+                            && rect.height > 0;
+                    });
+                }"""
+            )
+        )
+        if captcha_visible:
+            return "hcaptcha challenge"
+    except Exception:
+        logger.info("Could not inspect DOM-based bot blocker selectors")
+
     return None
 
 
@@ -702,6 +734,26 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
                     fields_filled=fields_filled,
                     resume_uploaded=resume_uploaded,
                 )
+            except PlaywrightTimeoutError:
+                bot_blocker_reason = _detect_bot_blocker(page)
+                if bot_blocker_reason:
+                    return _failure_result(
+                        "bot_blocked",
+                        f"Bot blocker detected: {bot_blocker_reason}",
+                        page_title=page_title,
+                        fields_filled=fields_filled,
+                        resume_uploaded=resume_uploaded,
+                        questions_answered=questions_answered,
+                        bot_blocked=True,
+                    )
+                return _failure_result(
+                    "inject_llm_answer",
+                    "Timed out while interacting with a screening question field.",
+                    page_title=page_title,
+                    fields_filled=fields_filled,
+                    resume_uploaded=resume_uploaded,
+                    questions_answered=questions_answered,
+                )
 
             if not questions_answered:
                 return _failure_result(
@@ -739,4 +791,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
         )
     finally:
         if browser:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                logger.info("Browser was already closed during shutdown")
