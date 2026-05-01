@@ -10,6 +10,18 @@ APPLICANT_FIELD_ALIASES = {
     "github": ["github", "github url", "git hub"],
     "website": ["website", "personal website", "site"],
     "location": ["location", "city"],
+    "work_authorization": [
+        "work authorization",
+        "work authorization status",
+        "work eligibility",
+        "work permit",
+        "authorized to work",
+    ],
+    "sponsorship": ["sponsorship", "visa sponsorship", "sponsorship required"],
+    "gender": ["gender", "gender identity"],
+    "race": ["race", "ethnicity"],
+    "veteran_status": ["veteran", "veteran status"],
+    "disability_status": ["disability", "disability status"],
 }
 
 

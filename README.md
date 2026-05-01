@@ -28,9 +28,12 @@ The agent includes lightweight browser compatibility and bot-block detection. It
 - `FastAPI` provides a small local REST wrapper around the browser agent.
 - `Playwright` controls Chromium and handles dynamic Lever DOM behavior.
 - `Groq` generates concise screening-question answers from the provided applicant profile.
+- Salary questions are answered with a deterministic safe response.
+- Structured dropdowns use deterministic safe logic when possible.
 - `Pydantic` validates request payloads and keeps response data structured.
 - `app/agent/browser.py` owns browser automation, while `app/services/` owns parsing and LLM helper logic.
 - The API maps internal automation outcomes to clear public JSON responses and HTTP status codes.
+- Bot-block or CAPTCHA states stop the run; the agent does not attempt bypasses.
 
 ## Project Structure
 
@@ -91,12 +94,14 @@ GROQ_API_KEY=your_groq_api_key_here
 GROQ_MODEL=llama-3.3-70b-versatile
 BROWSER_HEADLESS=true
 APP_LOG_LEVEL=INFO
+GROQ_TIMEOUT_SECONDS=15
 ```
 
 - `GROQ_API_KEY`: required for screening-answer generation
 - `GROQ_MODEL`: Groq model used by the LLM helper
 - `BROWSER_HEADLESS`: set to `false` when recording the demo
 - `APP_LOG_LEVEL`: logging level for API and agent steps
+- `GROQ_TIMEOUT_SECONDS`: hard timeout for LLM calls in seconds
 
 ## Running the Server
 
@@ -194,6 +199,8 @@ Logs are written to the server console. Major browser steps include:
 - `generate_llm_answer`
 - `inject_llm_answer`
 - `ready_to_submit`
+
+Verbose DOM/input dumps appear only when `APP_LOG_LEVEL=DEBUG`.
 
 Failures include a clean `step`, `reason`, and `bot_blocked` flag in the API response. Secrets and stack traces are not exposed in public JSON responses.
 

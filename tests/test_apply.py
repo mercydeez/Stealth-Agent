@@ -1,5 +1,6 @@
-from fastapi.testclient import TestClient
 from pathlib import Path
+
+from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.application_service import ApplicationService
@@ -106,6 +107,28 @@ def test_apply_endpoint_maps_bot_block_to_503(monkeypatch) -> None:
     assert response.json()["bot_blocked"] is True
 
 
+def test_apply_endpoint_maps_question_field_bot_block_to_503(monkeypatch) -> None:
+    async def mock_receive_application(payload):
+        return {
+            "status": "failed",
+            "fields_filled": ["name", "email", "phone"],
+            "resume_uploaded": True,
+            "questions_answered": [],
+            "bot_blocked": True,
+            "page_title": "Cin7 - Director of Product & Customer Marketing",
+            "step": "bot_blocked",
+            "reason": "Bot blocker detected while interacting with a screening question field.",
+        }
+
+    monkeypatch.setattr(ApplicationService, "receive_application", mock_receive_application)
+
+    response = client.post("/apply", json=_payload())
+
+    assert response.status_code == 503
+    assert response.json()["step"] == "bot_blocked"
+    assert response.json()["resume_uploaded"] is True
+
+
 def test_apply_endpoint_maps_timeout_to_504(monkeypatch) -> None:
     async def mock_receive_application(payload):
         return {
@@ -120,6 +143,22 @@ def test_apply_endpoint_maps_timeout_to_504(monkeypatch) -> None:
 
     assert response.status_code == 504
     assert response.json()["step"] == "page_load"
+
+
+def test_apply_endpoint_maps_question_injection_timeout_to_504(monkeypatch) -> None:
+    async def mock_receive_application(payload):
+        return {
+            "status": "failed",
+            "step": "inject_llm_answer",
+            "reason": "Timed out while interacting with a screening question field.",
+        }
+
+    monkeypatch.setattr(ApplicationService, "receive_application", mock_receive_application)
+
+    response = client.post("/apply", json=_payload())
+
+    assert response.status_code == 504
+    assert response.json()["step"] == "inject_llm_answer"
 
 
 def test_apply_endpoint_maps_unexpected_automation_failure_to_500(monkeypatch) -> None:
@@ -165,3 +204,10 @@ def test_non_lever_url_returns_400() -> None:
 
     assert response.status_code == 400
     assert response.json()["step"] == "validation"
+
+
+def test_repo_docs_and_sample_payload_exist() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+
+    assert (repo_root / "README.md").is_file()
+    assert (repo_root / "sample_payload.json").is_file()

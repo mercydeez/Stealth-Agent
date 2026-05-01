@@ -1,10 +1,8 @@
 import logging
-import os
 import re
 from pathlib import Path
 
 from dotenv import load_dotenv
-from groq import Groq
 from playwright.sync_api import ElementHandle, Page, TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
@@ -13,8 +11,9 @@ from app.core.config import settings
 from app.services.applicant_parser import parse_applicant_data
 from app.services.llm_service import (
     LLMConfigurationError,
-    LLMGenerationError,
+    SALARY_ANSWER,
     generate_screening_answer,
+    is_salary_question,
 )
 
 load_dotenv()
@@ -52,20 +51,15 @@ UPLOAD_BUTTON_SELECTORS = [
     'label[for*="resume"]',
 ]
 
-STANDARD_QUESTION_TERMS = {
-    "name",
-    "full name",
-    "email",
-    "e-mail",
-    "phone",
-    "mobile",
-    "telephone",
-    "location",
-    "city",
-    "linkedin",
-    "linkedin url",
-    "resume",
-    "cv",
+STANDARD_QUESTION_FIELD_KEYWORDS = {
+    "name": ("name", "full name"),
+    "email": ("email", "e-mail"),
+    "phone": ("phone", "mobile", "telephone"),
+    "location": ("location", "current location", "city"),
+    "linkedin_url": ("linkedin", "linkedin url"),
+    "portfolio": ("portfolio", "portfolio url"),
+    "github": ("github", "github url", "git hub"),
+    "website": ("website", "personal website", "site"),
 }
 
 MEANINGLESS_LABELS = {"", "*", "✱"}
@@ -73,13 +67,23 @@ BOT_BLOCKER_TERMS = (
     "verify you are human",
     "verify you're human",
     "captcha",
+    "h-captcha",
+    "hcaptcha",
+    "recaptcha",
+    "g-recaptcha",
     "access denied",
     "unusual traffic",
     "security check",
     "cloudflare",
+    "challenge",
     "bot detection",
     "blocked",
 )
+
+
+def _looks_like_bot_block(message: str) -> bool:
+    normalized = message.lower()
+    return any(term in normalized for term in BOT_BLOCKER_TERMS) or "intercepts pointer events" in normalized
 
 
 def _wait_for_form_or_apply_link(page: Page) -> bool:
@@ -107,7 +111,39 @@ def _wait_for_form_or_apply_link(page: Page) -> bool:
     return True
 
 
-def _detect_bot_blocker(page: Page) -> str | None:
+def _find_bot_block_text_term(combined_text: str) -> str | None:
+    for term in BOT_BLOCKER_TERMS:
+        if term == "challenge":
+            if any(keyword in combined_text for keyword in ("cloudflare", "security check", "verify")):
+                return term
+            continue
+        if term in combined_text:
+            return term
+    return None
+
+
+def detect_bot_block_from_signals(
+    *,
+    page_title: str,
+    page_text: str,
+    captcha_visible: bool,
+    challenge_visible: bool,
+    form_usable: bool,
+) -> str | None:
+    combined_text = f"{page_title}\n{page_text}".lower()
+    text_term = _find_bot_block_text_term(combined_text)
+    if text_term:
+        return f"text indicates bot block: {text_term}"
+
+    if captcha_visible or challenge_visible:
+        if not form_usable:
+            return "challenge detected and form not usable"
+        return "visible captcha/challenge element detected"
+
+    return None
+
+
+def detect_bot_block(page: Page) -> str | None:
     try:
         page_text = page.evaluate("() => document.body ? document.body.innerText : ''")
     except Exception:
@@ -118,11 +154,100 @@ def _detect_bot_blocker(page: Page) -> str | None:
     except Exception:
         page_title = ""
 
-    combined_text = f"{page_title}\n{page_text}".lower()
-    for term in BOT_BLOCKER_TERMS:
-        if term in combined_text:
-            return term
-    return None
+    try:
+        captcha_visible = bool(
+            page.evaluate(
+                """() => {
+                    const selectors = [
+                        '.h-captcha',
+                        '#h-captcha',
+                        'iframe[title*="hcaptcha"]',
+                        'iframe[src*="hcaptcha"]',
+                        'div.g-recaptcha',
+                        'iframe[title*="recaptcha"]',
+                        'iframe[src*="recaptcha"]',
+                        'iframe[title*="captcha"]',
+                        'iframe[src*="captcha"]',
+                    ];
+                    return selectors.some((selector) => {
+                        const node = document.querySelector(selector);
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.visibility !== "hidden"
+                            && style.display !== "none"
+                            && rect.width > 0
+                            && rect.height > 0;
+                    });
+                }"""
+            )
+        )
+    except Exception:
+        logger.info("Could not inspect DOM-based captcha selectors")
+        captcha_visible = False
+
+    try:
+        challenge_visible = bool(
+            page.evaluate(
+                """() => {
+                    const selectors = [
+                        '#cf-challenge',
+                        '#cf-challenge-running',
+                        '.cf-challenge',
+                        '#challenge-form',
+                        'form[id*="challenge"]',
+                        'div[id*="challenge"]',
+                        'iframe[title*="challenge"]',
+                        'iframe[src*="challenge"]',
+                    ];
+                    return selectors.some((selector) => {
+                        const node = document.querySelector(selector);
+                        if (!node) return false;
+                        const style = window.getComputedStyle(node);
+                        const rect = node.getBoundingClientRect();
+                        return style.visibility !== "hidden"
+                            && style.display !== "none"
+                            && rect.width > 0
+                            && rect.height > 0;
+                    });
+                }"""
+            )
+        )
+    except Exception:
+        logger.info("Could not inspect DOM-based challenge selectors")
+        challenge_visible = False
+
+    try:
+        form_usable = bool(
+            page.evaluate(
+                """() => {
+                    const form = document.querySelector('form');
+                    if (!form) return false;
+                    const fields = Array.from(form.querySelectorAll('input, textarea, select'));
+                    return fields.some((field) => {
+                        const style = window.getComputedStyle(field);
+                        const rect = field.getBoundingClientRect();
+                        const ariaDisabled = field.getAttribute('aria-disabled');
+                        return style.visibility !== 'hidden'
+                            && style.display !== 'none'
+                            && rect.width > 0
+                            && rect.height > 0
+                            && !field.disabled
+                            && ariaDisabled !== 'true';
+                    });
+                }"""
+            )
+        )
+    except Exception:
+        form_usable = True
+
+    return detect_bot_block_from_signals(
+        page_title=page_title,
+        page_text=page_text or "",
+        captcha_visible=captcha_visible,
+        challenge_visible=challenge_visible,
+        form_usable=form_usable,
+    )
 
 
 def _is_visible_element(element: ElementHandle) -> bool:
@@ -273,43 +398,212 @@ def _is_meaningful_label(label: str) -> bool:
     return len(alpha_numeric) >= 3
 
 
-def _pick_dropdown_option(applicant_data: str, label: str, option_texts: list[str]) -> str | None:
-    api_key = settings.groq_api_key or os.getenv("GROQ_API_KEY")
-    if not api_key:
-        logger.warning("GROQ_API_KEY is not set; skipping dropdown selection for '%s'", label)
+SPONSORSHIP_LABEL_KEYWORDS = (
+    "sponsorship",
+    "work authorization",
+    "work authorisation",
+    "work permit",
+    "eligible to work",
+    "visa",
+)
+GENDER_LABEL_KEYWORDS = ("gender", "gender identity", "sex")
+RACE_LABEL_KEYWORDS = ("race", "ethnicity")
+VETERAN_LABEL_KEYWORDS = ("veteran", "military")
+DISABILITY_LABEL_KEYWORDS = ("disability", "disabled")
+
+DECLINE_KEYWORDS = (
+    "prefer not",
+    "decline",
+    "do not wish",
+    "do not want",
+    "not disclose",
+    "not to answer",
+    "self-identify",
+    "self identify",
+)
+
+SPONSORSHIP_NO_KEYWORDS = (
+    "do not require sponsorship",
+    "does not require sponsorship",
+    "not require sponsorship",
+    "no sponsorship",
+    "no sponsorship required",
+    "authorized to work",
+    "authorised to work",
+    "eligible to work",
+    "not applicable",
+)
+SPONSORSHIP_YES_KEYWORDS = (
+    "require sponsorship",
+    "requires sponsorship",
+    "needs sponsorship",
+    "need sponsorship",
+    "sponsorship required",
+    "require visa",
+    "requires visa",
+    "will require sponsorship",
+)
+
+VETERAN_NO_KEYWORDS = (
+    "not a veteran",
+    "not veteran",
+    "non-veteran",
+    "no veteran",
+    "i am not a veteran",
+)
+
+DISABILITY_NO_KEYWORDS = (
+    "no disability",
+    "not disabled",
+    "do not have a disability",
+    "i do not have a disability",
+)
+
+
+def _option_has_keywords(option: str, keywords: tuple[str, ...]) -> bool:
+    normalized = _normalize_label(option)
+    for keyword in keywords:
+        if keyword in {"yes", "no"}:
+            if re.search(rf"\b{re.escape(keyword)}\b", normalized):
+                return True
+        elif keyword in normalized:
+            return True
+    return False
+
+
+def _find_option_by_keywords(option_texts: list[str], keywords: tuple[str, ...]) -> str | None:
+    for option in option_texts:
+        if _option_has_keywords(option, keywords):
+            return option
+    return None
+
+
+def _match_option_by_value(option_texts: list[str], target_value: str) -> str | None:
+    normalized_target = _normalize_label(target_value)
+    if not normalized_target:
         return None
 
-    prompt = f"""
-Job application dropdown field.
-Question/Label: {label}
-Available options: {option_texts}
-Applicant background: {applicant_data}
+    for option in option_texts:
+        normalized_option = _normalize_label(option)
+        if re.search(rf"\b{re.escape(normalized_target)}\b", normalized_option):
+            return option
+    return None
 
-Reply with ONLY the exact text of the best option to select. Nothing else.
-"""
 
-    try:
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model=settings.groq_model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "Choose the single best dropdown option for a job application field.",
-                },
-                {
-                    "role": "user",
-                    "content": prompt,
-                },
+def _applicant_requires_sponsorship(applicant_fields: dict[str, str]) -> bool | None:
+    candidate_text = " ".join(
+        filter(
+            None,
+            [
+                applicant_fields.get("work_authorization", ""),
+                applicant_fields.get("sponsorship", ""),
             ],
         )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as exc:
-        logger.warning("Failed to choose dropdown option for '%s': %s", label, exc)
+    )
+    normalized = _normalize_label(candidate_text)
+    if not normalized:
         return None
 
+    if any(phrase in normalized for phrase in SPONSORSHIP_YES_KEYWORDS):
+        return True
+    if any(phrase in normalized for phrase in SPONSORSHIP_NO_KEYWORDS):
+        return False
+    if "require" in normalized and "sponsorship" in normalized:
+        return True
+    if "no" in normalized and "sponsorship" in normalized:
+        return False
+    return None
 
-def _fill_dropdown_fields(page: Page, applicant_data: str) -> None:
+
+def _select_sponsorship_option(
+    option_texts: list[str], applicant_fields: dict[str, str]
+) -> str | None:
+    requires_sponsorship = _applicant_requires_sponsorship(applicant_fields)
+    if requires_sponsorship is True:
+        return _find_option_by_keywords(option_texts, SPONSORSHIP_YES_KEYWORDS) or _find_option_by_keywords(
+            option_texts, ("yes",)
+        )
+
+    return (
+        _find_option_by_keywords(option_texts, SPONSORSHIP_NO_KEYWORDS)
+        or _find_option_by_keywords(option_texts, ("no",))
+        or _find_option_by_keywords(option_texts, ("not applicable",))
+    )
+
+
+def _select_gender_option(option_texts: list[str], applicant_fields: dict[str, str]) -> str | None:
+    explicit_gender = applicant_fields.get("gender", "")
+    match = _match_option_by_value(option_texts, explicit_gender)
+    if match:
+        return match
+    return _find_option_by_keywords(option_texts, DECLINE_KEYWORDS)
+
+
+def _select_race_option(option_texts: list[str], applicant_fields: dict[str, str]) -> str | None:
+    explicit_race = applicant_fields.get("race", "")
+    match = _match_option_by_value(option_texts, explicit_race)
+    if match:
+        return match
+    return _find_option_by_keywords(option_texts, DECLINE_KEYWORDS)
+
+
+def _select_veteran_option(option_texts: list[str], applicant_fields: dict[str, str]) -> str | None:
+    explicit_veteran = applicant_fields.get("veteran_status", "")
+    if explicit_veteran:
+        match = _match_option_by_value(option_texts, explicit_veteran)
+        if match:
+            return match
+
+        normalized = _normalize_label(explicit_veteran)
+        if "not" in normalized or "no" in normalized:
+            return _find_option_by_keywords(option_texts, VETERAN_NO_KEYWORDS)
+        if "veteran" in normalized:
+            return _find_option_by_keywords(option_texts, ("veteran", "yes"))
+
+    return _find_option_by_keywords(option_texts, VETERAN_NO_KEYWORDS) or _find_option_by_keywords(
+        option_texts, DECLINE_KEYWORDS
+    )
+
+
+def _select_disability_option(option_texts: list[str], applicant_fields: dict[str, str]) -> str | None:
+    explicit_disability = applicant_fields.get("disability_status", "")
+    if explicit_disability:
+        match = _match_option_by_value(option_texts, explicit_disability)
+        if match:
+            return match
+        normalized = _normalize_label(explicit_disability)
+        if "no" in normalized or "not" in normalized:
+            return _find_option_by_keywords(option_texts, DISABILITY_NO_KEYWORDS) or _find_option_by_keywords(
+                option_texts, ("no",)
+            )
+        if "yes" in normalized or "have" in normalized:
+            return _find_option_by_keywords(option_texts, ("yes", "have a disability"))
+
+    return _find_option_by_keywords(option_texts, DECLINE_KEYWORDS)
+
+
+def select_dropdown_option(
+    label: str, option_texts: list[str], applicant_fields: dict[str, str]
+) -> str | None:
+    normalized_label = _normalize_label(label)
+    if not normalized_label:
+        return None
+
+    if any(keyword in normalized_label for keyword in SPONSORSHIP_LABEL_KEYWORDS):
+        return _select_sponsorship_option(option_texts, applicant_fields)
+    if any(keyword in normalized_label for keyword in GENDER_LABEL_KEYWORDS):
+        return _select_gender_option(option_texts, applicant_fields)
+    if any(keyword in normalized_label for keyword in RACE_LABEL_KEYWORDS):
+        return _select_race_option(option_texts, applicant_fields)
+    if any(keyword in normalized_label for keyword in VETERAN_LABEL_KEYWORDS):
+        return _select_veteran_option(option_texts, applicant_fields)
+    if any(keyword in normalized_label for keyword in DISABILITY_LABEL_KEYWORDS):
+        return _select_disability_option(option_texts, applicant_fields)
+
+    return None
+
+
+def _fill_dropdown_fields(page: Page, applicant_fields: dict[str, str]) -> None:
     selects = page.query_selector_all("select")
     logger.info("Found %s dropdown(s) on page", len(selects))
 
@@ -330,8 +624,9 @@ def _fill_dropdown_fields(page: Page, applicant_data: str) -> None:
             logger.info("Skipping dropdown '%s' because it has no usable options", label)
             continue
 
-        selected_option = _pick_dropdown_option(applicant_data, label, option_texts)
+        selected_option = select_dropdown_option(label, option_texts, applicant_fields)
         if not selected_option:
+            logger.debug("Skipping dropdown '%s' because no deterministic option was selected", label)
             continue
 
         matched_option = next(
@@ -340,7 +635,7 @@ def _fill_dropdown_fields(page: Page, applicant_data: str) -> None:
         )
         if not matched_option:
             logger.warning(
-                "Groq suggested '%s' for dropdown '%s', but no exact option matched",
+                "Selected option '%s' for dropdown '%s' did not match an available option",
                 selected_option,
                 label,
             )
@@ -352,33 +647,6 @@ def _fill_dropdown_fields(page: Page, applicant_data: str) -> None:
             logger.info("Selected dropdown '%s' with option '%s'", label, matched_option)
         except Exception as exc:
             logger.warning("Failed to select dropdown '%s': %s", label, exc)
-
-
-def _confirm_resume_upload(file_input: ElementHandle, filename: str) -> bool:
-    try:
-        input_value = file_input.input_value()
-        if filename.lower() in input_value.lower():
-            return True
-    except Exception:
-        logger.info("Could not read file input value while confirming resume upload")
-
-    try:
-        nearby_text = file_input.evaluate(
-            """element => {
-                const pieces = [];
-                const parentText = element.parentElement?.innerText || "";
-                const grandParentText = element.parentElement?.parentElement?.innerText || "";
-                const nextText = element.nextElementSibling?.innerText || "";
-                if (parentText) pieces.push(parentText);
-                if (grandParentText) pieces.push(grandParentText);
-                if (nextText) pieces.push(nextText);
-                return pieces.join(" ");
-            }"""
-        )
-        return filename.lower() in nearby_text.lower()
-    except Exception:
-        logger.info("Could not inspect nearby upload area text")
-        return False
 
 
 def _upload_resume(page: Page, resume_path: str) -> bool:
@@ -424,10 +692,31 @@ def _normalize_label(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
-def _is_standard_question(label: str) -> bool:
-    normalized = _normalize_label(label)
-    normalized = normalized.rstrip(":* ").strip()
-    return normalized in STANDARD_QUESTION_TERMS
+def _label_contains_keyword(normalized_label: str, keyword: str) -> bool:
+    if " " in keyword:
+        return keyword in normalized_label
+    return bool(re.search(rf"\b{re.escape(keyword)}\b", normalized_label))
+
+
+def _match_standard_field(question_label: str) -> str | None:
+    normalized = _normalize_label(question_label).rstrip(":* ").strip()
+    for field_name, keywords in STANDARD_QUESTION_FIELD_KEYWORDS.items():
+        for keyword in keywords:
+            if _label_contains_keyword(normalized, keyword):
+                return field_name
+    return None
+
+
+def select_standard_answer(question_label: str, applicant_fields: dict[str, str]) -> tuple[str | None, str | None]:
+    field_name = _match_standard_field(question_label)
+    if not field_name:
+        return None, None
+
+    value = (applicant_fields.get(field_name) or "").strip()
+    if not value:
+        return None, field_name
+
+    return value, field_name
 
 
 def _get_textarea_label(page: Page, textarea: ElementHandle) -> str:
@@ -495,8 +784,11 @@ def _generate_groq_answer(applicant_data: str, question_label: str) -> str:
     return generate_screening_answer(question_label, applicant_data)
 
 
-def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, str]]:
+def _answer_custom_questions(
+    page: Page, applicant_data: str, applicant_fields: dict[str, str]
+) -> list[dict[str, str]]:
     questions_answered: list[dict[str, str]] = []
+    llm_used = False
     for scroll_position in [0.25, 0.5, 0.75, 1.0]:
         page.evaluate(f"window.scrollTo(0, document.body.scrollHeight * {scroll_position})")
         page.wait_for_timeout(1000)
@@ -506,25 +798,25 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, 
     all_textareas = page.query_selector_all("textarea")
     all_selects = page.query_selector_all("select")
 
-    logger.info(f"DEBUG - Total inputs found: {len(all_inputs)}")
-    logger.info(f"DEBUG - Total textareas found: {len(all_textareas)}")  
-    logger.info(f"DEBUG - Total selects found: {len(all_selects)}")
+    logger.debug("Total inputs found: %s", len(all_inputs))
+    logger.debug("Total textareas found: %s", len(all_textareas))
+    logger.debug("Total selects found: %s", len(all_selects))
 
     for i, inp in enumerate(all_inputs):
         name = inp.get_attribute("name") or ""
         placeholder = inp.get_attribute("placeholder") or ""
         input_type = inp.get_attribute("type") or ""
-        logger.info(f"DEBUG input[{i}]: type={input_type} name={name} placeholder={placeholder}")
+        logger.debug("input[%s]: type=%s name=%s placeholder=%s", i, input_type, name, placeholder)
 
     for i, ta in enumerate(all_textareas):
         aria = ta.get_attribute("aria-label") or ""
         placeholder = ta.get_attribute("placeholder") or ""
         tid = ta.get_attribute("id") or ""
-        logger.info(f"DEBUG textarea[{i}]: id={tid} aria-label={aria} placeholder={placeholder}")
+        logger.debug("textarea[%s]: id=%s aria-label=%s placeholder=%s", i, tid, aria, placeholder)
 
     for i, sel in enumerate(all_selects):
         name = sel.get_attribute("name") or ""
-        logger.info(f"DEBUG select[{i}]: name={name}")
+        logger.debug("select[%s]: name=%s", i, name)
 
     textareas = page.query_selector_all("textarea")
     logger.info("Found %s textarea(s)", len(textareas))
@@ -539,13 +831,29 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, 
             logger.info("Skipping textarea because no label could be determined")
             continue
 
-        if _is_standard_question(question_label):
-            logger.info("Skipping standard field textarea: %s", question_label)
-            continue
-
-        logger.info("[generate_llm_answer] Generating answer for question: %s", question_label[:80])
-        answer = _generate_groq_answer(applicant_data, question_label)
-
+        standard_answer, standard_field = select_standard_answer(question_label, applicant_fields)
+        if standard_field:
+            if standard_answer:
+                logger.info(
+                    "Using applicant %s for standard question: %s",
+                    standard_field,
+                    question_label[:80],
+                )
+                answer = standard_answer
+            else:
+                logger.info("Skipping standard question with no applicant value: %s", question_label)
+                continue
+        elif is_salary_question(question_label):
+            logger.info("Using deterministic salary answer for question: %s", question_label[:80])
+            answer = SALARY_ANSWER
+        else:
+            if llm_used:
+                logger.info("Skipping additional open-ended question after LLM answer: %s", question_label[:80])
+                continue
+            logger.info("[generate_llm_answer] Generating answer for question: %s", question_label[:80])
+            answer = _generate_groq_answer(applicant_data, question_label)
+            llm_used = True
+        logger.info("[inject_llm_answer] Inserting generated answer into textarea")
         textarea.click()
         page.keyboard.press("Control+A")
         page.keyboard.press("Backspace")
@@ -557,7 +865,6 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, 
             }
         )
         logger.info("Answered question: %s", question_label[:50])
-        break
 
     return questions_answered
 
@@ -597,7 +904,7 @@ def _scan_additional_fields(page: Page) -> None:
         }"""
     )
 
-    logger.info("Visible input/textarea fields after scroll: %s", additional_fields)
+    logger.debug("Visible input/textarea fields after scroll: %s", additional_fields)
 
 
 def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dict:
@@ -627,7 +934,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
             try:
                 logger.info("[open_job_url] Navigating to job URL")
                 page.goto(job_url, wait_until="networkidle", timeout=settings.browser_timeout_ms)
-                bot_blocker_reason = _detect_bot_blocker(page)
+                bot_blocker_reason = detect_bot_block(page)
                 if bot_blocker_reason:
                     return _failure_result(
                         "bot_blocked",
@@ -638,7 +945,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
 
                 logger.info("[detect_form] Looking for application form")
                 if not _wait_for_form_or_apply_link(page):
-                    bot_blocker_reason = _detect_bot_blocker(page)
+                    bot_blocker_reason = detect_bot_block(page)
                     if bot_blocker_reason:
                         return _failure_result(
                             "bot_blocked",
@@ -647,9 +954,16 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
                             bot_blocked=True,
                         )
                     raise PlaywrightTimeoutError("Form not found or apply link unavailable")
-            except PlaywrightTimeoutError:
+            except PlaywrightTimeoutError as exc:
+                if _looks_like_bot_block(str(exc)):
+                    return _failure_result(
+                        "bot_blocked",
+                        "Bot blocker detected while loading the application form.",
+                        page_title=page.title(),
+                        bot_blocked=True,
+                    )
                 page_title = page.title()
-                bot_blocker_reason = _detect_bot_blocker(page)
+                bot_blocker_reason = detect_bot_block(page)
                 if bot_blocker_reason:
                     return _failure_result(
                         "bot_blocked",
@@ -667,7 +981,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
             logger.info("Page loaded successfully with title '%s'", page_title)
             page.wait_for_timeout(2000)
 
-            bot_blocker_reason = _detect_bot_blocker(page)
+            bot_blocker_reason = detect_bot_block(page)
             if bot_blocker_reason:
                 return _failure_result(
                     "bot_blocked",
@@ -702,7 +1016,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
                 fields_filled.append("location")
             page.wait_for_timeout(1000)
 
-            _fill_dropdown_fields(page, applicant_data)
+            _fill_dropdown_fields(page, applicant)
             page.wait_for_timeout(1000)
 
             logger.info("[upload_resume] Uploading resume")
@@ -719,14 +1033,44 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
             _scan_additional_fields(page)
             logger.info("[detect_questions] Looking for open-ended screening questions")
             try:
-                questions_answered = _answer_custom_questions(page, applicant_data)
-            except (LLMConfigurationError, LLMGenerationError) as exc:
+                questions_answered = _answer_custom_questions(page, applicant_data, applicant)
+            except LLMConfigurationError as exc:
                 return _failure_result(
                     "generate_llm_answer",
                     str(exc),
                     page_title=page_title,
                     fields_filled=fields_filled,
                     resume_uploaded=resume_uploaded,
+                )
+            except PlaywrightTimeoutError as exc:
+                if _looks_like_bot_block(str(exc)):
+                    return _failure_result(
+                        "bot_blocked",
+                        "Bot blocker detected while interacting with a screening question field.",
+                        page_title=page_title,
+                        fields_filled=fields_filled,
+                        resume_uploaded=resume_uploaded,
+                        questions_answered=questions_answered,
+                        bot_blocked=True,
+                    )
+                bot_blocker_reason = detect_bot_block(page)
+                if bot_blocker_reason:
+                    return _failure_result(
+                        "bot_blocked",
+                        f"Bot blocker detected: {bot_blocker_reason}",
+                        page_title=page_title,
+                        fields_filled=fields_filled,
+                        resume_uploaded=resume_uploaded,
+                        questions_answered=questions_answered,
+                        bot_blocked=True,
+                    )
+                return _failure_result(
+                    "inject_llm_answer",
+                    "Timed out while interacting with a screening question field.",
+                    page_title=page_title,
+                    fields_filled=fields_filled,
+                    resume_uploaded=resume_uploaded,
+                    questions_answered=questions_answered,
                 )
 
             if not questions_answered:
@@ -765,4 +1109,7 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
         )
     finally:
         if browser:
-            browser.close()
+            try:
+                browser.close()
+            except Exception:
+                logger.info("Browser was already closed during shutdown")
