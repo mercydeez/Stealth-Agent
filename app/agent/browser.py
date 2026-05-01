@@ -10,12 +10,17 @@ from playwright.sync_api import sync_playwright
 from playwright_stealth import Stealth
 
 from app.core.config import settings
+from app.services.applicant_parser import parse_applicant_data
+from app.services.llm_service import (
+    LLMConfigurationError,
+    LLMGenerationError,
+    generate_screening_answer,
+)
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 stealth = Stealth()
-GROQ_MODEL = "llama-3.3-70b-versatile"
 
 CHROME_WINDOWS_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -30,6 +35,9 @@ LEVER_FIELD_SELECTORS = {
     "email": 'input[name="email"]',
     "phone": 'input[name="phone"]',
     "linkedin_url": 'input[name="urls[LinkedIn]"]',
+    "portfolio": 'input[name="urls[Portfolio]"], input[name="urls[portfolio]"]',
+    "github": 'input[name="urls[GitHub]"], input[name="urls[Github]"], input[name="urls[github]"]',
+    "website": 'input[name="urls[Website]"], input[name="urls[website]"]',
 }
 
 RESUME_SELECTORS = [
@@ -43,14 +51,6 @@ UPLOAD_BUTTON_SELECTORS = [
     '[class*="upload"] button',
     'label[for*="resume"]',
 ]
-
-MARKDOWN_FIELD_ALIASES = {
-    "name": ["name", "full name"],
-    "email": ["email", "e-mail"],
-    "phone": ["phone", "mobile", "telephone"],
-    "linkedin_url": ["linkedin", "linkedin url", "linkedin_url"],
-    "location": ["location", "city"],
-}
 
 STANDARD_QUESTION_TERMS = {
     "name",
@@ -78,51 +78,30 @@ BOT_BLOCKER_TERMS = (
     "security check",
     "cloudflare",
     "bot detection",
+    "blocked",
 )
-
-
-def parse_applicant_data(applicant_data: str) -> dict[str, str]:
-    logger.info("Parsing applicant data markdown")
-    parsed_data: dict[str, str] = {}
-
-    for field_name, aliases in MARKDOWN_FIELD_ALIASES.items():
-        parsed_data[field_name] = ""
-        for alias in aliases:
-            pattern = rf"^\s*[-*]?\s*\**{re.escape(alias)}\**\s*:\s*(.+?)\s*$"
-            match = re.search(pattern, applicant_data, flags=re.IGNORECASE | re.MULTILINE)
-            if match:
-                parsed_data[field_name] = match.group(1).strip()
-                logger.info("Parsed applicant field: %s", field_name)
-                break
-
-        if not parsed_data[field_name]:
-            logger.info("Applicant field not found in markdown: %s", field_name)
-
-    return parsed_data
 
 
 def _wait_for_form_or_apply_link(page: Page) -> bool:
     try:
-        page.wait_for_selector("form", timeout=15000)
+        page.wait_for_selector("form", timeout=settings.browser_timeout_ms)
         page.wait_for_timeout(2000)
         logger.info("Application form detected on current page")
         return True
     except PlaywrightTimeoutError:
         logger.info("No form detected on current page after initial wait")
 
-    apply_link = page.query_selector('a[href$="/apply"]')
+    apply_link = page.query_selector('a[href$="/apply"], a:has-text("Apply"), button:has-text("Apply")')
     if apply_link is None:
         logger.warning("No application form or apply link found on page")
         return False
 
     apply_url = apply_link.get_attribute("href")
-    if not apply_url:
-        logger.warning("Apply link was found but did not contain a usable href")
-        return False
-
-    logger.info("Apply link found, navigating to application page: %s", apply_url)
-    page.goto(apply_url, wait_until="domcontentloaded")
-    page.wait_for_selector("form", timeout=15000)
+    logger.info("Apply control found; opening application form")
+    if apply_url:
+        logger.info("Apply control href: %s", apply_url)
+    apply_link.click()
+    page.wait_for_selector("form", timeout=settings.browser_timeout_ms)
     page.wait_for_timeout(2000)
     logger.info("Application form detected after navigating to apply page")
     return True
@@ -146,6 +125,48 @@ def _detect_bot_blocker(page: Page) -> str | None:
     return None
 
 
+def _is_visible_element(element: ElementHandle) -> bool:
+    try:
+        return bool(
+            element.evaluate(
+                """el => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== "hidden"
+                        && style.display !== "none"
+                        && rect.width > 0
+                        && rect.height > 0
+                        && !el.disabled;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
+def _failure_result(
+    step: str,
+    reason: str,
+    *,
+    page_title: str | None = None,
+    fields_filled: list[str] | None = None,
+    resume_uploaded: bool = False,
+    questions_answered: list[dict[str, str]] | None = None,
+    bot_blocked: bool = False,
+) -> dict:
+    logger.warning("[%s] %s", step, reason)
+    return {
+        "status": "failed",
+        "fields_filled": fields_filled or [],
+        "resume_uploaded": resume_uploaded,
+        "questions_answered": questions_answered or [],
+        "bot_blocked": bot_blocked,
+        "page_title": page_title,
+        "step": step,
+        "reason": reason,
+    }
+
+
 def _fill_lever_field(page: Page, field_name: str, selector: str, value: str) -> bool:
     if not value:
         logger.info("Skipping %s because no applicant value was provided", field_name)
@@ -154,6 +175,9 @@ def _fill_lever_field(page: Page, field_name: str, selector: str, value: str) ->
     field = page.query_selector(selector)
     if field is None:
         logger.info("Field not found: %s using selector %s", field_name, selector)
+        return False
+    if not _is_visible_element(field):
+        logger.info("Skipping hidden or disabled field: %s", field_name)
         return False
 
     logger.info("Field found: %s using selector %s", field_name, selector)
@@ -176,6 +200,9 @@ def _fill_location_field(page: Page, applicant_fields: dict[str, str]) -> bool:
         location_input = page.query_selector("input[placeholder*='ocation']")
     if not location_input:
         logger.info("Field not found: location")
+        return False
+    if not _is_visible_element(location_input):
+        logger.info("Skipping hidden or disabled field: location")
         return False
 
     location_input.click()
@@ -264,7 +291,7 @@ Reply with ONLY the exact text of the best option to select. Nothing else.
     try:
         client = Groq(api_key=api_key)
         response = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=settings.groq_model,
             messages=[
                 {
                     "role": "system",
@@ -464,38 +491,8 @@ def _get_textarea_label(page: Page, textarea: ElementHandle) -> str:
         return ""
 
 
-def _generate_groq_answer(applicant_data: str, question_label: str) -> str | None:
-    api_key = settings.groq_api_key or os.getenv("GROQ_API_KEY")
-    if not api_key:
-        logger.warning("GROQ_API_KEY is not set; skipping question answering")
-        return None
-
-    try:
-        client = Groq(api_key=api_key)
-        response = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a professional job applicant. Answer job application "
-                        "questions in 3-4 sentences. Be specific, confident, and authentic."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Applicant background: {applicant_data}\n\n"
-                        f"Question: {question_label}\n\n"
-                        "Provide a professional answer."
-                    ),
-                },
-            ],
-        )
-        return (response.choices[0].message.content or "").strip()
-    except Exception as exc:
-        logger.warning("Failed to generate Groq answer for question '%s': %s", question_label, exc)
-        return None
+def _generate_groq_answer(applicant_data: str, question_label: str) -> str:
+    return generate_screening_answer(question_label, applicant_data)
 
 
 def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, str]]:
@@ -533,6 +530,10 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, 
     logger.info("Found %s textarea(s)", len(textareas))
 
     for textarea in textareas:
+        if not _is_visible_element(textarea):
+            logger.info("Skipping hidden or disabled textarea")
+            continue
+
         question_label = _get_textarea_label(page, textarea)
         if not question_label or not _is_meaningful_label(question_label):
             logger.info("Skipping textarea because no label could be determined")
@@ -542,9 +543,8 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, 
             logger.info("Skipping standard field textarea: %s", question_label)
             continue
 
+        logger.info("[generate_llm_answer] Generating answer for question: %s", question_label[:80])
         answer = _generate_groq_answer(applicant_data, question_label)
-        if not answer:
-            continue
 
         textarea.click()
         page.keyboard.press("Control+A")
@@ -557,8 +557,16 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, 
             }
         )
         logger.info("Answered question: %s", question_label[:50])
+        break
 
     return questions_answered
+
+
+def _has_submit_button(page: Page) -> bool:
+    submit_button = page.query_selector(
+        'button[type="submit"], input[type="submit"], button:has-text("Submit Application"), button:has-text("Submit")'
+    )
+    return bool(submit_button and _is_visible_element(submit_button))
 
 
 def _scan_additional_fields(page: Page) -> None:
@@ -596,14 +604,18 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
     logger.info("Starting browser application flow for URL: %s", job_url)
     logger.info("Resume path received: %s", resume_path)
 
+    page_title: str | None = None
     applicant = parse_applicant_data(applicant_data)
     fields_filled: list[str] = []
+    resume_uploaded = False
+    questions_answered: list[dict[str, str]] = []
+    browser = None
 
-    with sync_playwright() as playwright:
-        logger.info("Launching Chromium browser")
-        browser = playwright.chromium.launch(headless=settings.browser_headless)
+    try:
+        with sync_playwright() as playwright:
+            logger.info("[open_job_url] Launching Chromium browser")
+            browser = playwright.chromium.launch(headless=settings.browser_headless)
 
-        try:
             logger.info("Creating browser context with Chrome Windows user agent")
             context = browser.new_context(
                 user_agent=CHROME_WINDOWS_USER_AGENT,
@@ -613,63 +625,43 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
             stealth.apply_stealth_sync(page)
 
             try:
-                logger.info("Navigating to job URL")
-                page.goto(job_url, wait_until="networkidle")
+                logger.info("[open_job_url] Navigating to job URL")
+                page.goto(job_url, wait_until="networkidle", timeout=settings.browser_timeout_ms)
                 bot_blocker_reason = _detect_bot_blocker(page)
                 if bot_blocker_reason:
-                    logger.warning("Bot blocker detected after initial navigation: %s", bot_blocker_reason)
-                    return {
-                        "status": "failed",
-                        "step": "bot_blocked",
-                        "reason": f"Bot blocker detected: {bot_blocker_reason}",
-                        "fields_filled": [],
-                        "resume_uploaded": False,
-                        "questions_answered": [],
-                        "bot_blocked": True,
-                        "page_title": page.title(),
-                    }
+                    return _failure_result(
+                        "bot_blocked",
+                        f"Bot blocker detected: {bot_blocker_reason}",
+                        page_title=page.title(),
+                        bot_blocked=True,
+                    )
 
+                logger.info("[detect_form] Looking for application form")
                 if not _wait_for_form_or_apply_link(page):
                     bot_blocker_reason = _detect_bot_blocker(page)
                     if bot_blocker_reason:
-                        logger.warning("Bot blocker detected while waiting for form: %s", bot_blocker_reason)
-                        return {
-                            "status": "failed",
-                            "step": "bot_blocked",
-                            "reason": f"Bot blocker detected: {bot_blocker_reason}",
-                            "fields_filled": [],
-                            "resume_uploaded": False,
-                            "questions_answered": [],
-                            "bot_blocked": True,
-                            "page_title": page.title(),
-                        }
+                        return _failure_result(
+                            "bot_blocked",
+                            f"Bot blocker detected: {bot_blocker_reason}",
+                            page_title=page.title(),
+                            bot_blocked=True,
+                        )
                     raise PlaywrightTimeoutError("Form not found or apply link unavailable")
             except PlaywrightTimeoutError:
                 page_title = page.title()
                 bot_blocker_reason = _detect_bot_blocker(page)
                 if bot_blocker_reason:
-                    logger.warning("Bot blocker detected on timed out page '%s': %s", page_title, bot_blocker_reason)
-                    return {
-                        "status": "failed",
-                        "step": "bot_blocked",
-                        "reason": f"Bot blocker detected: {bot_blocker_reason}",
-                        "fields_filled": [],
-                        "resume_uploaded": False,
-                        "questions_answered": [],
-                        "bot_blocked": True,
-                        "page_title": page_title,
-                    }
-                logger.warning("Form not found or page timed out for title '%s'", page_title)
-                return {
-                    "status": "failed",
-                    "step": "page_load",
-                    "reason": "Form not found or page timed out",
-                    "fields_filled": [],
-                    "resume_uploaded": False,
-                    "questions_answered": [],
-                    "bot_blocked": False,
-                    "page_title": page_title,
-                }
+                    return _failure_result(
+                        "bot_blocked",
+                        f"Bot blocker detected: {bot_blocker_reason}",
+                        page_title=page_title,
+                        bot_blocked=True,
+                    )
+                return _failure_result(
+                    "page_load",
+                    "Form not found or page timed out",
+                    page_title=page_title,
+                )
 
             page_title = page.title()
             logger.info("Page loaded successfully with title '%s'", page_title)
@@ -677,32 +669,23 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
 
             bot_blocker_reason = _detect_bot_blocker(page)
             if bot_blocker_reason:
-                logger.warning("Bot blocker detected after form load: %s", bot_blocker_reason)
-                return {
-                    "status": "failed",
-                    "step": "bot_blocked",
-                    "reason": f"Bot blocker detected: {bot_blocker_reason}",
-                    "fields_filled": fields_filled,
-                    "resume_uploaded": False,
-                    "questions_answered": [],
-                    "bot_blocked": True,
-                    "page_title": page_title,
-                }
+                return _failure_result(
+                    "bot_blocked",
+                    f"Bot blocker detected: {bot_blocker_reason}",
+                    page_title=page_title,
+                    fields_filled=fields_filled,
+                    bot_blocked=True,
+                )
 
             is_dead_page = "404" in page_title.lower() or "not found" in page_title.lower()
             if is_dead_page:
-                logger.warning("Job posting not found after form wait. title='%s'", page_title)
-                return {
-                    "status": "failed",
-                    "step": "page_load",
-                    "reason": "Job posting not found or form not available",
-                    "fields_filled": [],
-                    "resume_uploaded": False,
-                    "questions_answered": [],
-                    "bot_blocked": False,
-                    "page_title": page_title,
-                }
+                return _failure_result(
+                    "page_load",
+                    "Job posting not found or form not available",
+                    page_title=page_title,
+                )
 
+            logger.info("[fill_contact_fields] Filling standard applicant fields")
             for field_name, selector in LEVER_FIELD_SELECTORS.items():
                 was_filled = _fill_lever_field(
                     page=page,
@@ -722,10 +705,43 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
             _fill_dropdown_fields(page, applicant_data)
             page.wait_for_timeout(1000)
 
+            logger.info("[upload_resume] Uploading resume")
             resume_uploaded = _upload_resume(page, resume_path)
+            if not resume_uploaded:
+                return _failure_result(
+                    "upload_resume",
+                    "Resume upload failed or upload field was unavailable",
+                    page_title=page_title,
+                    fields_filled=fields_filled,
+                )
             page.wait_for_timeout(1000)
+
             _scan_additional_fields(page)
-            questions_answered = _answer_custom_questions(page, applicant_data)
+            logger.info("[detect_questions] Looking for open-ended screening questions")
+            try:
+                questions_answered = _answer_custom_questions(page, applicant_data)
+            except (LLMConfigurationError, LLMGenerationError) as exc:
+                return _failure_result(
+                    "generate_llm_answer",
+                    str(exc),
+                    page_title=page_title,
+                    fields_filled=fields_filled,
+                    resume_uploaded=resume_uploaded,
+                )
+
+            if not questions_answered:
+                return _failure_result(
+                    "detect_questions",
+                    "No open-ended textarea screening question could be answered",
+                    page_title=page_title,
+                    fields_filled=fields_filled,
+                    resume_uploaded=resume_uploaded,
+                )
+
+            if _has_submit_button(page):
+                logger.info("[ready_to_submit] Submit button detected; stopping before final submit")
+            else:
+                logger.info("[ready_to_submit] Form filled; no visible submit button detected")
 
             logger.info("Finished filling fields: %s", fields_filled)
 
@@ -737,5 +753,16 @@ def fill_application(job_url: str, applicant_data: str, resume_path: str) -> dic
                 "bot_blocked": False,
                 "page_title": page_title,
             }
-        finally:
+    except Exception:
+        logger.exception("Unexpected browser automation failure")
+        return _failure_result(
+            "automation",
+            "Unexpected automation failure.",
+            page_title=page_title,
+            fields_filled=fields_filled,
+            resume_uploaded=resume_uploaded,
+            questions_answered=questions_answered,
+        )
+    finally:
+        if browser:
             browser.close()

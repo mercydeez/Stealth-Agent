@@ -1,0 +1,5 @@
+{
+  "job_url": "https://jobs.lever.co/company/example-job",
+  "applicant_data": "# Applicant\n\n- Name: Jane Doe\n- Email: jane@example.com\n- Phone: +1 555 0101\n- LinkedIn: https://www.linkedin.com/in/janedoe\n- Location: Toronto, ON\n- Portfolio: https://github.com/janedoe",
+  "resume_path": "C:/path/to/resume.pdf"
+}
