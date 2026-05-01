@@ -238,15 +238,3 @@ Tests do not call real Lever pages, do not launch a real browser, and do not cal
 | Job form not found | Posting closed or page structure changed | Try another Lever-hosted posting |
 | Bot blocked response | ATS protection or abnormal browser state | Re-run in visible mode and inspect the page |
 | Timeout | Slow network or page load | Increase timeout in config or retry |
-
-## Demo Video Checklist
-
-- Set `BROWSER_HEADLESS=false`
-- Start server with `python run.py`
-- Send `POST /apply` using Postman, cURL, or Thunder Client
-- Show browser opening
-- Show fields filled
-- Show resume uploaded
-- Show LLM answer inserted
-- Show it stopping before submit
-- Show final JSON response
