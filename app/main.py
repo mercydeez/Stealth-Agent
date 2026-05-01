@@ -2,6 +2,8 @@ import logging
 import os
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 
 from app.api import api_router
 from app.core.config import settings
@@ -26,6 +28,30 @@ def create_app() -> FastAPI:
         description="Stealth Agent - headless job application automation",
     )
     app.include_router(api_router)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request, exc):
+        logger = logging.getLogger(__name__)
+        sanitized_errors = [
+            error.get("msg", "Invalid request input.")
+            for error in exc.errors()
+        ]
+        reason = "; ".join(sanitized_errors) or "Invalid request input."
+        logger.warning("Request validation failed: %s", reason)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "failed",
+                "fields_filled": [],
+                "resume_uploaded": False,
+                "questions_answered": [],
+                "bot_blocked": False,
+                "page_title": None,
+                "step": "validation",
+                "reason": reason,
+            },
+        )
+
     return app
 
 
