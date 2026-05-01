@@ -354,33 +354,6 @@ def _fill_dropdown_fields(page: Page, applicant_data: str) -> None:
             logger.warning("Failed to select dropdown '%s': %s", label, exc)
 
 
-def _confirm_resume_upload(file_input: ElementHandle, filename: str) -> bool:
-    try:
-        input_value = file_input.input_value()
-        if filename.lower() in input_value.lower():
-            return True
-    except Exception:
-        logger.info("Could not read file input value while confirming resume upload")
-
-    try:
-        nearby_text = file_input.evaluate(
-            """element => {
-                const pieces = [];
-                const parentText = element.parentElement?.innerText || "";
-                const grandParentText = element.parentElement?.parentElement?.innerText || "";
-                const nextText = element.nextElementSibling?.innerText || "";
-                if (parentText) pieces.push(parentText);
-                if (grandParentText) pieces.push(grandParentText);
-                if (nextText) pieces.push(nextText);
-                return pieces.join(" ");
-            }"""
-        )
-        return filename.lower() in nearby_text.lower()
-    except Exception:
-        logger.info("Could not inspect nearby upload area text")
-        return False
-
-
 def _upload_resume(page: Page, resume_path: str) -> bool:
     for selector in UPLOAD_BUTTON_SELECTORS:
         upload_button = page.query_selector(selector)
@@ -546,6 +519,7 @@ def _answer_custom_questions(page: Page, applicant_data: str) -> list[dict[str, 
         logger.info("[generate_llm_answer] Generating answer for question: %s", question_label[:80])
         answer = _generate_groq_answer(applicant_data, question_label)
 
+        logger.info("[inject_llm_answer] Inserting generated answer into textarea")
         textarea.click()
         page.keyboard.press("Control+A")
         page.keyboard.press("Backspace")

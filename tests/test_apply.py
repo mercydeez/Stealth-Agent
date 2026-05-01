@@ -1,5 +1,6 @@
-from fastapi.testclient import TestClient
 from pathlib import Path
+
+from fastapi.testclient import TestClient
 
 from app.main import app
 from app.services.application_service import ApplicationService
